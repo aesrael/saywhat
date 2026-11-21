@@ -20,7 +20,8 @@ pub mod segment;
 pub mod mic;
 
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -73,6 +74,7 @@ pub struct Loaded {
 pub struct Transcriber {
     tx: Option<mpsc::Sender<Vec<f32>>>,
     worker: Option<JoinHandle<Result<()>>>,
+    closed: Arc<AtomicBool>,
     pub loaded: Loaded,
 }
 
@@ -84,11 +86,13 @@ impl Transcriber {
     {
         let (tx, rx) = mpsc::channel::<Vec<f32>>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<Loaded>>();
+        let closed = Arc::new(AtomicBool::new(false));
+        let worker_closed = closed.clone();
         let worker = std::thread::Builder::new()
             .name("saywhat-decode".into())
-            .spawn(move || run(cfg, rx, ready_tx, on_update))?;
+            .spawn(move || run(cfg, rx, worker_closed, ready_tx, on_update))?;
         match ready_rx.recv() {
-            Ok(Ok(loaded)) => Ok(Self { tx: Some(tx), worker: Some(worker), loaded }),
+            Ok(Ok(loaded)) => Ok(Self { tx: Some(tx), worker: Some(worker), closed, loaded }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(worker.join().map_err(|_| anyhow!("decoder panicked"))?.err().unwrap_or_else(|| anyhow!("decoder exited"))),
         }
@@ -106,13 +110,15 @@ impl Transcriber {
         self.tx.clone().expect("transcriber running")
     }
 
-    /// Ends the input: the open utterance is decoded, every queued update delivered, then this returns.
+    /// Ends the input: audio already queued and the open utterance are decoded, every update delivered,
+    /// then this returns. Feeders still held elsewhere (a reader blocked on a pipe) no longer keep it open.
     pub fn finish(mut self) -> Result<()> {
         self.stop()
     }
 
     fn stop(&mut self) -> Result<()> {
         self.tx.take();
+        self.closed.store(true, Ordering::Relaxed);
         match self.worker.take() {
             Some(w) => w.join().map_err(|_| anyhow!("decoder panicked"))?,
             None => Ok(()),
@@ -126,7 +132,7 @@ impl Drop for Transcriber {
     }
 }
 
-fn run<F: FnMut(Update)>(cfg: Config, rx: mpsc::Receiver<Vec<f32>>, ready: mpsc::Sender<Result<Loaded>>, mut emit: F) -> Result<()> {
+fn run<F: FnMut(Update)>(cfg: Config, rx: mpsc::Receiver<Vec<f32>>, closed: Arc<AtomicBool>, ready: mpsc::Sender<Result<Loaded>>, mut emit: F) -> Result<()> {
     let t0 = Instant::now();
     let setup = (|| -> Result<_> {
         transcribe_cpp::disable_logging();
@@ -156,7 +162,7 @@ fn run<F: FnMut(Update)>(cfg: Config, rx: mpsc::Receiver<Vec<f32>>, ready: mpsc:
         }
         vad.predict_f32(&c)
     });
-    let mut pump = Pump { rx, seg, queue: Default::default(), done: false };
+    let mut pump = Pump { rx, closed, seg, queue: Default::default(), done: false };
 
     // One utterance at a time. A streaming model gets a fresh stream per utterance (a finalised stream
     // cannot restart) and is fed while the speaker talks; other models decode the utterance at the pause.
@@ -214,6 +220,7 @@ fn run<F: FnMut(Update)>(cfg: Config, rx: mpsc::Receiver<Vec<f32>>, ready: mpsc:
 /// in progress is still decoded.
 struct Pump<F: FnMut(&[f32]) -> f32> {
     rx: mpsc::Receiver<Vec<f32>>,
+    closed: Arc<AtomicBool>,
     seg: Segmenter<F>,
     queue: std::collections::VecDeque<Event>,
     done: bool,
@@ -228,8 +235,10 @@ impl<F: FnMut(&[f32]) -> f32> Pump<F> {
             if self.done {
                 return None;
             }
-            match self.rx.recv() {
+            match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(chunk) => self.queue.extend(self.seg.push(&chunk)),
+                // Queued audio always comes out first, so a close only takes effect once it is drained.
+                Err(mpsc::RecvTimeoutError::Timeout) if !self.closed.load(Ordering::Relaxed) => {}
                 Err(_) => {
                     self.queue.extend(self.seg.finish());
                     self.done = true;
