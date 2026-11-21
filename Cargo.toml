@@ -1,0 +1,36 @@
+[package]
+name = "saywhat"
+version = "0.1.0"
+description = "Live, local speech-to-text on the command line"
+license = "MIT"
+repository = "https://github.com/aesrael/saywhat"
+readme = "README.md"
+keywords = ["speech-to-text", "transcription", "asr", "parakeet", "cli"]
+categories = ["command-line-utilities", "multimedia::audio"]
+edition = "2024"
+
+[dependencies]
+transcribe-cpp = { version = "0.4.2", default-features = false }
+earshot = "1.2.2"
+hound = { version = "3.5.1", optional = true }
+anyhow = "1"
+clap = { version = "4", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+signal-hook = { version = "0.3", optional = true }
+cpal = { version = "0.18.2", optional = true }
+
+[features]
+default = ["cli", "mic"]
+# The `saywhat` binary.
+cli = ["dep:clap", "dep:serde_json", "dep:signal-hook", "dep:hound"]
+# Microphone capture (saywhat::mic).
+mic = ["dep:cpal"]
+# Apple Silicon GPU.
+metal = ["transcribe-cpp/metal"]
+
+[[bin]]
+name = "saywhat"
+required-features = ["cli", "mic"]
+
+[profile.release]
+strip = true
